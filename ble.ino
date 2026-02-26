@@ -1,20 +1,37 @@
 /**
- * This file keeps the BLE helpers, to send the data over bluetooth
- * to the bike computer. Or any other receiver, if dev/debug.
+ * BLE helpers for transmitting cycling power meter data over Bluetooth Low Energy.
+ * Targets the Adafruit Feather nRF52832.
+ *
+ * Advertising the Cycling Power Service (0x1818) with instantaneous power
+ * and crank revolution data, compatible with Garmin 830 and other head units
+ * implementing the Bluetooth SIG Cycling Power Profile.
+ *
+ * Crank Revolution Data (flags bit 5):
+ *   - Cumulative Crank Revolutions: uint16, monotonically increasing, rolls
+ *     over naturally at 65535.
+ *   - Last Crank Event Time: uint16, in 1/1024-second units, rolls over at
+ *     65535 (~64 seconds). This is the timestamp captured at the moment of the
+ *     crank event — NOT the time of the BLE notification. The head unit derives
+ *     cadence from the delta between consecutive event times:
+ *       cadence (RPM) = 60 * 1024 / (lastEventTime_n - lastEventTime_n-1)
+ *     The value must be frozen at the crank event moment and re-transmitted
+ *     unchanged in every packet until the next crank event occurs.
  *
  * For the Adafruit BLE lib, see:
- * https://github.com/adafruit/Adafruit_nRF52_Arduino/tree/bd0747473242d5d7c58ebc67ab0aa5098db56547/libraries/Bluefruit52Lib
+ *   https://github.com/adafruit/Adafruit_nRF52_Arduino/tree/master/libraries/Bluefruit52Lib
  */
 
+#include <bluefruit.h>
 #include <stdarg.h>
 
-// Service and character constants at:
-// https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/bd0747473242d5d7c58ebc67ab0aa5098db56547/libraries/Bluefruit52Lib/src/BLEUuid.h
-/* Pwr Service Definitions
- * Cycling Power Service:      0x1818
- * Power Measurement Char:     0x2A63
- * Cycling Power Feature Char: 0x2A65
- * Sensor Location Char:       0x2A5D
+/* Cycling Power Service Definitions
+ * Cycling Power Service:               0x1818
+ * Power Measurement Characteristic:    0x2A63
+ * Cycling Power Feature Characteristic: 0x2A65
+ * Sensor Location Characteristic:      0x2A5D
+ *
+ * UUID constants from:
+ *   https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/libraries/Bluefruit52Lib/src/BLEUuid.h
  */
 BLEService        pwrService  = BLEService(UUID16_SVC_CYCLING_POWER);
 BLECharacteristic pwrMeasChar = BLECharacteristic(UUID16_CHR_CYCLING_POWER_MEASUREMENT);
@@ -31,13 +48,6 @@ BLEDis bledis;    // DIS (Device Information Service) helper class instance
 BLEBas blebas;    // BAS (Battery Service) helper class instance
 
 void bleSetup() {
-  // Pass an explicit GATT attribute count to Bluefruit.begin().
-  // The nRF52832 has a fixed GATT attribute table. If it overflows,
-  // services and characteristics are silently dropped or their handles
-  // shift, causing the app to see wrong UUIDs under wrong services and
-  // empty values everywhere. 32 slots is sufficient for our service set:
-  //   ~7 auto (GenericAccess + GenericAttr) + ~6 DIS + ~3 BAS
-  //   + 11 pwrService (svc + 3 chars + CCCD) + 4 logService (ifdef)
   Bluefruit.begin(1, 0);
   Bluefruit.setName(DEV_NAME);
 
@@ -45,14 +55,13 @@ void bleSetup() {
   // setup. Accepted values (dBm): -40, -30, -20, -16, -12, -8, -4, 0, 4
   Bluefruit.setTxPower(-8);
 
-  // Set the connect/disconnect callback handlers
+  // Disable the blue connection LED to reduce power draw.
+  Bluefruit.autoConnLed(false);
+
+  // Register connect/disconnect callbacks.
   Bluefruit.Periph.setConnectCallback(connectCallback);
   Bluefruit.Periph.setDisconnectCallback(disconnectCallback);
 
-  // off Blue LED for lowest power consumption
-  Bluefruit.autoConnLed(false);
-
-  // Configure and Start the Device Information Service
   bledis.setManufacturer("Adafruit Industries");
   bledis.setModel("Bluefruit Feather52");
   bledis.begin();
@@ -77,13 +86,14 @@ void bleSetup() {
 }
 
 void startAdv(void) {
-  // Advertising packet
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(pwrService);
+
 #ifdef BLE_LOGGING
   Bluefruit.Advertising.addService(logService);
 #endif
+
   Bluefruit.Advertising.addName();
 
   /* Start Advertising
@@ -102,61 +112,49 @@ void startAdv(void) {
 }
 
 /*
- * Set up the power service
+ * Configure the Cycling Power Service and its three mandatory characteristics.
  */
 void setupPwr(void) {
-  // Configure supported characteristics:
   pwrService.begin();
 
-  // Note: You must call .begin() on the BLEService before calling .begin() on
-  // any characteristic(s) within that service definition.. Calling .begin() on
-  // a BLECharacteristic will cause it to be added to the last BLEService that
-  // was 'begin()'ed!
+  // Note: .begin() on a BLECharacteristic registers it under the most recently
+  // begun BLEService. Always call pwrService.begin() before the characteristics.
 
-  // Has to have notify enabled.
-  // Power measurement. This is the characteristic that really matters. See:
-  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.characteristic.cycling_power_measurement.xml
-  // NOTIFY|READ: app reads the last value on connection without waiting for a notify.
+  // --- Power Measurement (0x2A63) ---
+  // Mandatory. NOTIFY for live updates; READ so the head unit can fetch the
+  // last value on connection before the first notification arrives.
+  //
+  // Payload layout (all fields little-endian):
+  //   [0-1]  Flags                        uint16  0x0020 = crank data present
+  //   [2-3]  Instantaneous Power          int16   watts (signed)
+  //   [4-5]  Cumulative Crank Revolutions uint16  rolls over at 65535
+  //   [6-7]  Last Crank Event Time        uint16  1/1024 s units, rolls over at 65535
   pwrMeasChar.setProperties(CHR_PROPS_NOTIFY | CHR_PROPS_READ);
-  // First param is the read permission, second is write.
   pwrMeasChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  // 8 total bytes: flags(2) + instantPwr(2) + crankRevs(2) + lastEventTime(2)
   pwrMeasChar.setFixedLen(8);
-  // Optionally capture Client Characteristic Config Descriptor updates
-  //pwrMeasChar.setCccdWriteCallback(cccdCallback);
   pwrMeasChar.begin();
-  // Write a zeroed initial value so the attribute is non-empty on first read.
-  // flags=0x0020 signals crank data fields are present; power=0, revs=0, time=0.
+  // Write a valid zeroed initial value so the attribute is non-empty on first
+  // read. flags=0x0020 declares crank fields are present; all values zero.
   uint8_t initPwr[8] = { 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
   pwrMeasChar.write(initPwr, sizeof(initPwr));
 
-  /*
-   * The other two characterstics aren't updated over time, they're static info
-   * relaying what's available in our service and characteristics.
-   */
-
-  // Characteristic for power feature. Has to be readable, but not necessarily
-  // notify. 32 bit value of what's supported, see
-  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.characteristic.cycling_power_feature.xml
+  // --- Cycling Power Feature (0x2A65) ---
+  // Mandatory, Read-only. 32-bit little-endian bitmask of supported features.
+  // Bit 3: Crank Revolution Data Supported — must match the crank fields in 2A63.
   pwrFeatChar.setProperties(CHR_PROPS_READ);
   pwrFeatChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  // 1 32-bit value
   pwrFeatChar.setFixedLen(4);
   pwrFeatChar.begin();
-  // Bit 3: Crank Revolution Data Supported. All other optional features clear.
-  // Writing a non-zero value also confirms to the app that the read is working
-  // (write32(0) renders as blank in Bluefruit Connect, same as an empty attribute).
-  pwrFeatChar.write32(0x00000000); //zero to prevent advertising the cadence
+  pwrFeatChar.write32(0x00000008);  // bit 3 = Crank Revolution Data Supported
 
-  // Characteristic for sensor location. Has to be readable, but not necessarily
-  // notify. See:
-  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.characteristic.sensor_location.xml
+  // --- Sensor Location (0x2A5D) ---
+  // Mandatory, Read-only. Single byte identifying sensor mounting position.
+  // 5 = Left Crank.
   pwrLocChar.setProperties(CHR_PROPS_READ);
   pwrLocChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   pwrLocChar.setFixedLen(1);
   pwrLocChar.begin();
-  // Set location to "left crank"
-  pwrLocChar.write8(5);
+  pwrLocChar.write8(5);  // 5 = Left Crank
 }
 
 /*
@@ -165,81 +163,56 @@ void setupPwr(void) {
 #ifdef BLE_LOGGING
 void setupBleLogger() {
   logService.begin();
-
-  // Has nothing to do with any spec.
   logChar.setProperties(CHR_PROPS_NOTIFY);
-  // First param is the read permission, second is write.
   logChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  // Payload is quite limited in BLE, so come up with good logging shorthand.
   logChar.setMaxLen(20);
   logChar.begin();
 }
 #endif
 
 /*
- * Publish the instantaneous power measurement.
+ * Publish a Cycling Power Measurement notification.
+ *
+ * @param instantPwr     Instantaneous power in watts (signed)
+ * @param crankRevs      Cumulative crank revolution count (rolls over at 65535)
+ * @param crankEventTime Timestamp of the most recent crank event in 1/1024-second
+ *                       units, already cast to uint16_t (rollover is expected and
+ *                       handled correctly by the head unit).
+ *                       This must be the frozen moment the crank event was detected
+ *                       in power.ino — NOT millis() at the time of this call.
+ *                       Re-send the same value between events; the head unit only
+ *                       updates cadence when it sees the revolution count increment.
  */
-void blePublishPower(int16_t instantPwr, uint16_t crankRevs, long millisLast) {
-  // Power measure characteristic
-  /**
-   * Fields
-   *
-   * Flags (16 bits):
-   *   b0 pedal power balance present
-   *   b1 pedal power balance reference
-   *   b2 accumulated torque present
-   *   b3 accumulated torque source
-   *   b4 wheel revolution data present
-   *   b5 crank revolution data present
-   *   b6 extreme force magnitudes present
-   *   b7 extreme torque magnitudes present
-   *   b8 extreme angles present
-   *   b9 top dead spot angle present
-   *   b10 bottom dead spot angle present
-   *   b11 accumulated energy present
-   *   b12 offset compenstation indicator
-   *   b13 reserved
-   *
-   * Instananous Power:
-   *   16 bits signed int
-   *   
-   * Cumulative Crank Revolutions:
-   *   16 bits signed int
-   *
-   * Last Crank Event Time
-   *   16 bits signed int
+void blePublishPower(int16_t instantPwr, uint16_t crankRevs, uint16_t crankEventTime) {
+  /*
+   * Cycling Power Measurement flags (uint16, little-endian):
+   *   b0  Pedal Power Balance Present
+   *   b1  Pedal Power Balance Reference
+   *   b2  Accumulated Torque Present
+   *   b3  Accumulated Torque Source
+   *   b4  Wheel Revolution Data Present
+   *   b5  Crank Revolution Data Present  <-- set
+   *   b6  Extreme Force Magnitudes Present
+   *   b7  Extreme Torque Magnitudes Present
+   *   b8  Extreme Angles Present
+   *   b9  Top Dead Spot Angle Present
+   *   b10 Bottom Dead Spot Angle Present
+   *   b11 Accumulated Energy Present
+   *   b12 Offset Compensation Indicator
    */
-  // Flag bit 5: crank revolution data present (0x0020).
-  // Original code used 0b0010000000000000 which set bit 13 (reserved), not bit 5.
-  uint16_t flag = 0x0020;
-  //uint16_t flag = 0b0000000000000000;
+  const uint16_t flags = 0x0020;  // bit 5: crank revolution data present
 
-  // All data in characteristics goes least-significant octet first.
-  // Split them up into 8-bit ints. LSO ends up first in array.
-  uint8_t flags[2];
-  uint16ToLso(flag, flags);
-  uint8_t pwr[2];
-  uint16ToLso(instantPwr, pwr);
-
-  // Cadnce last event time is time of last event, in 1/1024 second resolution
-  uint16_t lastEventTime = uint16_t(millisLast / 1000.f * 1024.f) % 65536;
-  // Split the 16-bit ints into 8 bits, LSO is first in array.
-  uint8_t cranks[2];
-  uint16ToLso(crankRevs, cranks);
-  uint8_t lastTime[2];
-  uint16ToLso(lastEventTime, lastTime);
-
-  // All fields are 16-bit values, split into two 8-bit values.
-  uint8_t pwrdata[8] = { flags[0], flags[1], pwr[0], pwr[1], cranks[0], cranks[1], lastTime[0], lastTime[1] };
-  //uint8_t pwrdata[4] = { flags[0], flags[1], pwr[0], pwr[1] };
-
-  //Log.notice("BLE published flags: %X %X pwr: %X %X cranks: %X %X last time: %X %X\n", 
-  //           pwrdata[0], pwrdata[1], pwrdata[2], pwrdata[3], pwrdata[4], pwrdata[5], pwrdata[6], pwrdata[7]);
+  uint8_t pwrdata[8];
+  uint16ToLso(flags,          &pwrdata[0]);
+  uint16ToLso(instantPwr,     &pwrdata[2]);
+  uint16ToLso(crankRevs,      &pwrdata[4]);
+  uint16ToLso(crankEventTime, &pwrdata[6]);
 
   if (pwrMeasChar.notify(pwrdata, sizeof(pwrdata))) {
 #ifdef DEBUG
-    Serial.print("Power measurement updated to: ");
-    Serial.println(instantPwr);
+    Serial.print("Power: ");     Serial.print(instantPwr);
+    Serial.print("W  Revs: ");   Serial.print(crankRevs);
+    Serial.print("  Event: ");   Serial.println(crankEventTime);
 #endif
   } else {
 #ifdef DEBUG
@@ -248,100 +221,86 @@ void blePublishPower(int16_t instantPwr, uint16_t crankRevs, long millisLast) {
   }
 }
 
+/*
+ * Update the Battery Service level (0-100%).
+ */
 void blePublishBatt(uint8_t battPercent) {
   blebas.write(battPercent);
 #ifdef DEBUG
-  Serial.printf("Updated battery percentage to %d", battPercent);
+  Serial.printf("Updated battery percentage to %d%%\n", battPercent);
 #endif
 }
 
 /*
- * Publish a tiny little log message over BLE. Pass a null-terminated
- * char*, in 20 chars or less (counting the null).
+ * Publish a short formatted log message over BLE (BLE_LOGGING builds only).
+ * Capped at 19 printable characters + null terminator = 20 bytes total.
  */
 #ifdef BLE_LOGGING
 void blePublishLog(const char* fmt, ...) {
-  static const short MAX = 20;  // 19 chars plus the null terminator
+  static const int MAX = 20;
   static char msg[MAX];
 
   va_list args;
   va_start(args, fmt);
-  int numBytes = vsprintf(msg, fmt, args);
+  int numBytes = vsnprintf(msg, MAX, fmt, args);  // safe: won't overflow buffer
   va_end(args);
 
   if (numBytes < 0) {
-    Serial.println("Failed to write BLE log to buffer");
-  } else if (numBytes > MAX) {
-    Serial.printf("Too many bytes written (%d), overflowed the msg buffer.\n", numBytes);
-    Serial.printf("Original message: %s\n", msg);
+    Serial.println("BLE log: encoding error");
+  } else if (numBytes >= MAX) {
+    Serial.printf("BLE log: truncated to %d bytes\n", MAX - 1);
+    logChar.notify(msg, MAX - 1);
   } else {
-    bool ret = logChar.notify(msg, numBytes);
-    if (ret) {
-      Serial.printf("Sent log %d byte message: %s\n", ret, msg);
-    } else {
-      Serial.println("Failed to publish log message over BLE.");
+    if (!logChar.notify(msg, numBytes)) {
+      Serial.println("BLE log: notify failed");
     }
+#ifdef DEBUG
+    else {
+      Serial.printf("BLE log (%d bytes): %s\n", numBytes, msg);
+    }
+#endif
   }
 }
 #endif
 
+/*
+ * Callback: BLE central connected.
+ */
 void connectCallback(uint16_t connHandle) {
-  char centralName[32] = { 0 };
-  Bluefruit.getName(centralName, sizeof(centralName));
+  BLEConnection* connection = Bluefruit.Connection(connHandle);
+  char peerName[32] = { 0 };
+  connection->getPeerName(peerName, sizeof(peerName));
 
-  // Light up our 'connected' LED
-  digitalWrite(LED_PIN, 1);
+  digitalWrite(LED_PIN, HIGH);
 
 #ifdef DEBUG
-  Serial.print("Connected to ");
-  Serial.println(centralName);
+  Serial.print("Connected to: ");
+  Serial.println(peerName[0] != '\0' ? peerName : "(unknown)");
 #endif
 }
 
-/**
- * Callback invoked when a connection is dropped
- * @param conn_handle connection where this event happens
- * @param reason is a BLE_HCI_STATUS_CODE which can be found in ble_hci.h
- * https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/cores/nRF5/nordic/softdevice/s140_nrf52_6.1.1_API/include/ble_hci.h
+/*
+ * Callback: BLE central disconnected.
+ * @param reason  HCI status code from ble_hci.h
  */
 void disconnectCallback(uint16_t connHandle, uint8_t reason) {
   (void) connHandle;
   (void) reason;
 
-  digitalWrite(LED_PIN, 0);
+  digitalWrite(LED_PIN, LOW);
 
 #ifdef DEBUG
-      Serial.println("Disconnected");
-      Serial.println("Advertising!");
+  Serial.print("Disconnected, reason: 0x");
+  Serial.println(reason, HEX);
+  Serial.println("Resuming advertising...");
 #endif
 }
-/*
-void cccdCallback(BLECharacteristic& chr, uint16_t cccdValue) {
-#ifdef DEBUG
-  // Display the raw request packet
-    Serial.printf("CCCD Updated: %d\n", cccdValue);
 
-  // Check the characteristic this CCCD update is associated with in case
-  // this handler is used for multiple CCCD records.
-  if (chr.uuid == pwrMeasChar.uuid) {
-    if (chr.notifyEnabled()) {
-      Serial.println("Pwr Measurement 'Notify' enabled");
-    } else {
-      Serial.println("Pwr Measurement 'Notify' disabled");
-    }
-  }
-#endif
-}
-*/
 /*
- * Given a 16-bit uint16_t, convert it to 2 8-bit ints, and set
- * them in the provided array. Assume the array is of correct
- * size, allocated by caller. Least-significant octet is place
- * in output array first.
+ * Write a uint16_t into a 2-byte array in little-endian order (LSO first),
+ * as required by all BLE GATT characteristic fields.
  */
 void uint16ToLso(uint16_t val, uint8_t* out) {
-  uint8_t lso = val & 0xff;
-  uint8_t mso = (val >> 8) & 0xff;
-  out[0] = lso;
-  out[1] = mso;
+  out[0] = val & 0xff;
+  out[1] = (val >> 8) & 0xff;
 }
