@@ -70,6 +70,11 @@ void setup() {
   }
 #endif
 
+  // Publish an initial battery reading immediately at startup.
+  // Without this, blebas holds its uninitialised default value until the
+  // first 5-minute gate elapses, which was showing as 0xCA (202%) on connect.
+  blePublishBatt(checkBatt());
+
 #ifdef DEBUG
   // The F Macro stores strings in flash (program space) instead of RAM
   Serial.println(F("All setup complete."));
@@ -212,7 +217,7 @@ void loop() {
 
       // Check the battery every 5 minutes.
       if ((timeNow - lastInfrequentUpdate) > (1000 * 60 * 5)) {
-        float batPercent = checkBatt();
+        uint8_t batPercent = checkBatt();
         blePublishBatt(batPercent);
         lastInfrequentUpdate = timeNow;
       }
@@ -270,27 +275,35 @@ int16_t calcPower(double footSpeed, double force) {
  *
  */
 uint8_t checkBatt() {
-  float measuredvbat = analogRead(VBATPIN);
-  measuredvbat *= 2;    // Board divided by 2, so multiply back
-  measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
-  measuredvbat /= 1024; // convert to voltage
-  // TODO would be cool to convert to an accurate percentage, but takes
-  // some science because I read it's not a linear discharge. For now
-  // make it super simple, based off this info from Adafruit:
+  // The nRF52832 ADC is 12-bit (0-4095) with a 3.6V internal reference.
+  // The Feather board has a /2 resistor divider on VBATPIN, so the actual
+  // battery voltage is twice the measured voltage.
+  //
+  // Correct formula:
+  //   voltage = (raw / 4096.0) * 3.6V_ref * 2 (divider correction)
   //
   // Lipoly batteries are 'maxed out' at 4.2V and stick around 3.7V
   // for much of the battery life, then slowly sink down to 3.2V or
   // so before the protection circuitry cuts it off. By measuring the
   // voltage you can quickly tell when you're heading below 3.7V
-  if (measuredvbat > 4.1) {
+  float measuredvbat = (analogRead(VBATPIN) / 4096.0f) * 3.6f * 2.0f;
+
+  // Lipoly discharge profile (approximate):
+  //   > 4.1V  = full (100%)
+  //   > 3.9V  = high (90%)
+  //   > 3.7V  = nominal (70%) — battery spends most of its life here
+  //   > 3.5V  = low (40%)
+  //   > 3.3V  = critical (20%) — protection circuit will cut off soon
+  //   <= 3.3V = nearly empty (5%)
+  if (measuredvbat > 4.1f) {
     return 100;
-  } else if (measuredvbat > 3.9) {
+  } else if (measuredvbat > 3.9f) {
     return 90;
-  } else if (measuredvbat > 3.7) {
+  } else if (measuredvbat > 3.7f) {
     return 70;
-  } else if (measuredvbat > 3.5) {
+  } else if (measuredvbat > 3.5f) {
     return 40;
-  } else if (measuredvbat > 3.3) {
+  } else if (measuredvbat > 3.3f) {
     return 20;
   } else {
     return 5;
