@@ -71,14 +71,15 @@ void gyroSetup() {
   gyro.setZeroMotionDetectionDuration(80);
   gyro.setInterruptLatchClear(true);
 
-  pinMode(GYRO_INT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(GYRO_INT_PIN), motionDetectChange, RISING);
+  //pinMode(GYRO_INT_PIN, INPUT_PULLUP);
+  //attachInterrupt(digitalPinToInterrupt(GYRO_INT_PIN), motionDetectChange, RISING);
 
 #ifdef DEBUG
   dumpSettings();
 #endif
 }
 
+// Power meter stops outputting serial if it prints either go to sleep or wakey wakey...
 void motionDetectChange() {
   uint8_t motion = gyro.getMotionStatus();
   // TODO note really clear what our power options actually are here..

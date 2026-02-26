@@ -11,54 +11,23 @@
 #include "HX711.h"
 
 // Trek
-//#define DEBUG
+#define DEBUG
 //#define BLE_LOGGING
 //#define CALIBRATE
 #define DISABLE_LOGGING  // to the SD
 // Crank length, in meters
-#define CRANK_RADIUS 0.1725
+#define CRANK_RADIUS 0.175
 #define LOAD_OFFSET 255904.f
 #define HX711_MULT  -2466.8989547
 #define GYRO_OFFSET -31
 // Hooked up the wires backwards apparently, force is negated.
 // If it isn't, just set to 1.
-#define HOOKEDUPLOADBACKWARDS -1
+#define HOOKEDUPLOADBACKWARDS 1
 #define DEV_NAME "JrvsPwr"
-
-/*
-// Steve Merckx defines
-//#define DEBUG
-//#define BLE_LOGGING
-//#define CALIBRATE
-#define DISABLE_LOGGING  // to the SD
-// Crank length, in meters
-#define CRANK_RADIUS 0.1750
-#define LOAD_OFFSET -32000.f
-#define HX711_MULT  -2719.66716169
-#define GYRO_OFFSET 3
-// Hooked up the wires backwards apparently, force is negated.
-// If it isn't, just set to 1.
-#define HOOKEDUPLOADBACKWARDS -1
-#define DEV_NAME "JrvsPwr"
-*/
-
-// Allie Orbea defines
-/*
-//#define DEBUG
-//#define BLE_LOGGING
-//#define CALIBRATE
-#define DISABLE_LOGGING  // to the SD
-#define CRANK_RADIUS 0.1725
-#define LOAD_OFFSET 3300.f;  // Allie Orbea
-#define HX711_MULT  -2491.63452396
-#define GYRO_OFFSET -50
-#define HOOKEDUPLOADBACKWARDS -1
-#define DEV_NAME "AlPwr"
-*/
 
 // Universal defines
 
-#define VBATPIN A7
+#define VBATPIN A7 //battery voltage monitor (inbuilt)
 
 // The pause for the loop, and based on testing the actual
 // calls overhead take about 20ms themselves E.g. at 50ms delay, 

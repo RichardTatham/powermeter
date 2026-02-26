@@ -31,12 +31,23 @@ BLEDis bledis;    // DIS (Device Information Service) helper class instance
 BLEBas blebas;    // BAS (Battery Service) helper class instance
 
 void bleSetup() {
-  Bluefruit.begin();
+  // Pass an explicit GATT attribute count to Bluefruit.begin().
+  // The nRF52832 has a fixed GATT attribute table. If it overflows,
+  // services and characteristics are silently dropped or their handles
+  // shift, causing the app to see wrong UUIDs under wrong services and
+  // empty values everywhere. 32 slots is sufficient for our service set:
+  //   ~7 auto (GenericAccess + GenericAttr) + ~6 DIS + ~3 BAS
+  //   + 11 pwrService (svc + 3 chars + CCCD) + 4 logService (ifdef)
+  Bluefruit.begin(1, 0);
   Bluefruit.setName(DEV_NAME);
 
+  // Set TX power immediately after begin(), before any service or advertising
+  // setup. Accepted values (dBm): -40, -30, -20, -16, -12, -8, -4, 0, 4
+  Bluefruit.setTxPower(-8);
+
   // Set the connect/disconnect callback handlers
-  Bluefruit.setConnectCallback(connectCallback);
-  Bluefruit.setDisconnectCallback(disconnectCallback);
+  Bluefruit.Periph.setConnectCallback(connectCallback);
+  Bluefruit.Periph.setDisconnectCallback(disconnectCallback);
 
   // off Blue LED for lowest power consumption
   Bluefruit.autoConnLed(false);
@@ -68,8 +79,6 @@ void bleSetup() {
 void startAdv(void) {
   // Advertising packet
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  // Set max power. Accepted values are: -40, -30, -20, -16, -12, -8, -4, 0, 4
-  Bluefruit.setTxPower(-8);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(pwrService);
 #ifdef BLE_LOGGING
@@ -107,14 +116,19 @@ void setupPwr(void) {
   // Has to have notify enabled.
   // Power measurement. This is the characteristic that really matters. See:
   // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.characteristic.cycling_power_measurement.xml
-  pwrMeasChar.setProperties(CHR_PROPS_NOTIFY);
+  // NOTIFY|READ: app reads the last value on connection without waiting for a notify.
+  pwrMeasChar.setProperties(CHR_PROPS_NOTIFY | CHR_PROPS_READ);
   // First param is the read permission, second is write.
   pwrMeasChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  // 4 total bytes, 2 16-bit values
-  pwrMeasChar.setFixedLen(4);
+  // 8 total bytes: flags(2) + instantPwr(2) + crankRevs(2) + lastEventTime(2)
+  pwrMeasChar.setFixedLen(8);
   // Optionally capture Client Characteristic Config Descriptor updates
-  pwrMeasChar.setCccdWriteCallback(cccdCallback);
+  //pwrMeasChar.setCccdWriteCallback(cccdCallback);
   pwrMeasChar.begin();
+  // Write a zeroed initial value so the attribute is non-empty on first read.
+  // flags=0x0020 signals crank data fields are present; power=0, revs=0, time=0.
+  uint8_t initPwr[8] = { 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  pwrMeasChar.write(initPwr, sizeof(initPwr));
 
   /*
    * The other two characterstics aren't updated over time, they're static info
@@ -129,8 +143,10 @@ void setupPwr(void) {
   // 1 32-bit value
   pwrFeatChar.setFixedLen(4);
   pwrFeatChar.begin();
-  // No extras for now, write 0.
-  pwrFeatChar.write32(0);
+  // Bit 3: Crank Revolution Data Supported. All other optional features clear.
+  // Writing a non-zero value also confirms to the app that the read is working
+  // (write32(0) renders as blank in Bluefruit Connect, same as an empty attribute).
+  pwrFeatChar.write32(0x00000000); //zero to prevent advertising the cadence
 
   // Characteristic for sensor location. Has to be readable, but not necessarily
   // notify. See:
@@ -193,8 +209,9 @@ void blePublishPower(int16_t instantPwr, uint16_t crankRevs, long millisLast) {
    * Last Crank Event Time
    *   16 bits signed int
    */
-  // Flag cadence. Put most-significant octet first, it'll flip later.
-  uint16_t flag = 0b0010000000000000;
+  // Flag bit 5: crank revolution data present (0x0020).
+  // Original code used 0b0010000000000000 which set bit 13 (reserved), not bit 5.
+  uint16_t flag = 0x0020;
   //uint16_t flag = 0b0000000000000000;
 
   // All data in characteristics goes least-significant octet first.
@@ -223,8 +240,10 @@ void blePublishPower(int16_t instantPwr, uint16_t crankRevs, long millisLast) {
 #ifdef DEBUG
     Serial.print("Power measurement updated to: ");
     Serial.println(instantPwr);
+#endif
   } else {
-    Serial.println("ERROR: Power notify not set in the CCCD or not connected!");
+#ifdef DEBUG
+    Serial.println("ERROR: Notify failed - CCCD not enabled or not connected!");
 #endif
   }
 }
@@ -268,7 +287,7 @@ void blePublishLog(const char* fmt, ...) {
 
 void connectCallback(uint16_t connHandle) {
   char centralName[32] = { 0 };
-  Bluefruit.Gap.getPeerName(connHandle, centralName, sizeof(centralName));
+  Bluefruit.getName(centralName, sizeof(centralName));
 
   // Light up our 'connected' LED
   digitalWrite(LED_PIN, 1);
@@ -296,7 +315,7 @@ void disconnectCallback(uint16_t connHandle, uint8_t reason) {
       Serial.println("Advertising!");
 #endif
 }
-
+/*
 void cccdCallback(BLECharacteristic& chr, uint16_t cccdValue) {
 #ifdef DEBUG
   // Display the raw request packet
@@ -313,7 +332,7 @@ void cccdCallback(BLECharacteristic& chr, uint16_t cccdValue) {
   }
 #endif
 }
-
+*/
 /*
  * Given a 16-bit uint16_t, convert it to 2 8-bit ints, and set
  * them in the provided array. Assume the array is of correct
