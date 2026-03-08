@@ -44,7 +44,8 @@
 #define GYRO_OFFSET            -31      // Raw MPU6050 Z-axis bias
 #define HOOKEDUPLOADBACKWARDS  1        // Set to -1 if force sign is naturally correct
 
-#define VBATPIN      A7   // Feather built-in VBAT pin (/2 resistor divider)
+#define VBATPIN           A7    // Feather built-in VBAT pin (/2 resistor divider)
+#define BATT_CAPACITY_MAH 450   // LiPo cell capacity — informs low-battery thresholds
 #define LED_PIN      33
 #define HX711_dout   A0
 #define HX711_sck    A1
@@ -140,6 +141,12 @@ void setup() {
 
   pinMode(LED_PIN,      OUTPUT);
   digitalWrite(LED_PIN, LOW);
+
+  // nRF52832 ADC defaults to 10-bit (0-1023). checkBatt() divides by 4096,
+  // so 12-bit resolution must be set explicitly or all voltage readings are
+  // compressed to ~25% of their true value, permanently returning 5%.
+  analogReadResolution(12);          // 12-bit: 0–4095
+  pinMode(VBATPIN, INPUT);           // Explicitly configure VBAT pin before first read
 
   lastSessionStart = millis();
 
@@ -372,14 +379,22 @@ void printLastSessionData() {
 
 // ===========================================================================
 // checkBatt()
-// nRF52832: 12-bit ADC, 3.6 V ref, /2 divider on VBATPIN
+// nRF52832: 12-bit ADC (0–4095), 3.6 V reference, /2 resistor divider on VBATPIN.
+// analogReadResolution(12) must be called in setup() for the divisor to be correct.
+//
+// Voltage thresholds reflect a single-cell LiPo discharge curve (4.2V full,
+// ~3.2V protection cutoff). Percentages are mapped to approximate remaining
+// capacity. For a BATT_CAPACITY_MAH (450 mAh) cell the usable window between
+// 3.5V and cutoff is only ~45 mAh, so the low-battery bands below 3.5V are
+// tightened to give maximum warning before the protection circuit triggers.
 // ===========================================================================
 uint8_t checkBatt() {
   float v = (analogRead(VBATPIN) / 4096.0f) * 3.6f * 2.0f;
-  if      (v > 4.1f) return 100;
-  else if (v > 3.9f) return 90;
-  else if (v > 3.7f) return 70;
-  else if (v > 3.5f) return 40;
-  else if (v > 3.3f) return 20;
-  else               return 5;
+  if      (v > 4.1f) return 100;  // ~450 mAh remaining  (fully charged)
+  else if (v > 3.9f) return 80;   // ~360 mAh remaining
+  else if (v > 3.7f) return 60;   // ~270 mAh remaining
+  else if (v > 3.5f) return 30;   // ~135 mAh remaining
+  else if (v > 3.4f) return 15;   // ~67  mAh — charge soon
+  else if (v > 3.3f) return 5;    // ~22  mAh — critically low for 450 mAh cell
+  else               return 1;    // At or below protection threshold — charge immediately
 }

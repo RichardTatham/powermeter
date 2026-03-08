@@ -144,6 +144,9 @@ void setupPwr(void) {
   pwrCtrlChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
   pwrCtrlChar.setMaxLen(5);
   pwrCtrlChar.setWriteCallback(cpControlPointCallback);
+  // CCCD callback required so the head unit can enable indications.
+  // Without this, pwrCtrlChar.indicate() silently fails on strict clients.
+  pwrCtrlChar.setCccdWriteCallback(ctrlPointCccdCallback);
   pwrCtrlChar.begin();
 }
 
@@ -254,31 +257,54 @@ void printfLog(const char* fmt, ...) {
 // ---------------------------------------------------------------------------
 // CP Control Point callback (0x2A66)
 // The head unit writes an op code; we must respond with an indication.
-// Response format: [0x20][echo op code][result] {optional params}
+//
+// Response format (CPPS spec §4.14.2):
+//   Byte 0: 0x20  — Response Op Code (fixed)
+//   Byte 1: <echo of the received op code>
+//   Byte 2: Result Code  0x01=Success  0x02=Op Code Not Supported
+//   Byte 3+: Optional response parameter(s)
+//
+// Op code 0x03 — Request Supported Sensor Locations:
+//   Returns a list of all sensor locations the device supports.
+//   This device has a single left-crank sensor → location value 0x05.
 // ---------------------------------------------------------------------------
 void cpControlPointCallback(uint16_t connHandle, BLECharacteristic* chr,
                             uint8_t* data, uint16_t len) {
   if (len == 0) return;
   uint8_t opCode = data[0];
 
-  uint8_t response[4] = { 0x20, opCode, 0x02, 0x00 };
-  uint8_t responseLen = 3;
-
   switch (opCode) {
-    case 0x01: response[2] = 0x01; break;  // Set Cumulative Value → Success
-    case 0x02: response[2] = 0x01; break;  // Update Sensor Location → Success
-    case 0x03:                              // Request Supported Locations → [Left Crank]
-      response[2] = 0x01;
-      response[3] = 0x05;
-      responseLen = 4;
+
+    case 0x01: {  // Set Cumulative Value → acknowledge, no action needed
+      uint8_t resp[] = { 0x20, 0x01, 0x01 };
+      pwrCtrlChar.indicate(connHandle, resp, sizeof(resp));
       break;
-    default: response[2] = 0x02; break;    // Op Code Not Supported
+    }
+
+    case 0x02: {  // Update Sensor Location → acknowledge, location is fixed
+      uint8_t resp[] = { 0x20, 0x02, 0x01 };
+      pwrCtrlChar.indicate(connHandle, resp, sizeof(resp));
+      break;
+    }
+
+    case 0x03: {  // Request Supported Sensor Locations
+      // Response parameter: list of supported CPPS sensor location values.
+      // 0x05 = Left Crank (CPPS spec §3.3, Table 3.3).
+      // One entry only — this is a single left-crank power meter.
+      uint8_t resp[] = { 0x20, 0x03, 0x01, 0x05 };
+      pwrCtrlChar.indicate(connHandle, resp, sizeof(resp));
+      break;
+    }
+
+    default: {    // Op Code Not Supported
+      uint8_t resp[] = { 0x20, opCode, 0x02 };
+      pwrCtrlChar.indicate(connHandle, resp, sizeof(resp));
+      break;
+    }
   }
 
-  pwrCtrlChar.indicate(connHandle, response, responseLen);
-
 #ifdef DEBUG
-  Serial.printf("CP ctrl: op=0x%02X result=0x%02X\n", opCode, response[2]);
+  Serial.printf("CP ctrl: op=0x%02X\n", opCode);
 #endif
 }
 
@@ -293,6 +319,19 @@ void cccdCallback(uint16_t conn_hdl, BLECharacteristic* chr, uint16_t cccdValue)
                    ? F("Power notify enabled")
                    : F("Power notify disabled"));
   }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// ctrlPointCccdCallback — called when the head unit enables/disables
+// indications on the CP Control Point (0x2A66).
+// The head unit must write 0x0002 here before any indicate() call will
+// succeed. Strict clients (e.g. Garmin) do this immediately after bonding.
+// ---------------------------------------------------------------------------
+void ctrlPointCccdCallback(uint16_t conn_hdl, BLECharacteristic* chr, uint16_t cccdValue) {
+#ifdef DEBUG
+  Serial.printf("CP ctrl CCCD: 0x%04X (%s)\n", cccdValue,
+                (cccdValue & 0x0002) ? "indications enabled" : "indications disabled");
 #endif
 }
 
