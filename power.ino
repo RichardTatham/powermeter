@@ -63,7 +63,7 @@
 // Calibration defaults (used when no saved file exists)
 // ---------------------------------------------------------------------------
 #define LOAD_OFFSET_DEFAULT    255904L
-#define LOAD_MULT_DEFAULT      -2466.8989547f
+#define LOAD_MULT_DEFAULT      1824.3f //personal calibration factor
 #define CALIBRATIONS_FILENAME  "/calibrations.txt"
 #define gn                     9.80665f  // m/s² — used in calibrate.ino
 #define PWR_MEAS_CHAR_LEN      8         // BLE packet length — used in ble.ino
@@ -181,7 +181,6 @@ void loop() {
   avgDps += dps;
 
   // Load cell sample
-  newLoadDataReady = 0;
   float force = getAvgForce();
   if (force > maxForce) maxForce = force;
   if (force < minForce) minForce = force;
